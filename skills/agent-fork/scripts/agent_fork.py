@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""agent-fork - continue your current AI coding chat in Claude Code, Codex, or OpenCode.
+"""agent-fork - continue an AI coding chat in another coding agent.
 
-Run it from inside a chat with a `!` prefix (`!agent-fork codex`) or from any
-terminal (`agent-fork codex`). It copies the conversation into the target tool's
-own session format, then opens it in a new terminal tab in the same folder.
-No AI calls are made; only local session files are read and written.
+Run by the `agent-fork` skill. Between Claude Code, Codex and OpenCode it copies
+the chat into the target agent's own session format, so it shows up as real
+history. Any other agent gets the chat as the first message of a new session
+(a "handoff"). The new chat opens in a new terminal tab in the same folder.
 """
 
 import argparse
@@ -22,15 +22,53 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
-TOOLS = ("claude", "codex", "opencode")
-LABELS = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode"}
-ALIASES = {
-    "claude": "claude", "cc": "claude", "claude-code": "claude", "claudecode": "claude",
-    "codex": "codex", "cx": "codex",
-    "opencode": "opencode", "oc": "opencode", "open-code": "opencode",
-}
+
+def _agent(id, name, bins, prompt, aliases=(), packages=()):
+    """bins: executables (first one found is launched; all count for detection).
+    prompt: arguments that start an interactive session with a first message
+    ("{prompt}" is replaced), or None if the CLI can't do that."""
+    return {"id": id, "name": name, "bins": bins, "prompt": prompt,
+            "aliases": aliases, "packages": packages}
+
+
+AGENTS = [
+    _agent("claude", "Claude Code", ("claude",), ["{prompt}"], ("cc", "claude-code", "claudecode")),
+    _agent("codex", "Codex", ("codex",), ["{prompt}"], ("cx", "openai")),
+    _agent("opencode", "OpenCode", ("opencode",), ["--prompt", "{prompt}"], ("oc", "open-code")),
+    _agent("copilot", "GitHub Copilot", ("copilot",), ["-i", "{prompt}"], ("github", "gh-copilot"), ("@github/copilot",)),
+    _agent("cursor", "Cursor", ("cursor-agent", "agent"), ["{prompt}"], ("cursor-agent",)),
+    _agent("gemini", "Gemini CLI", ("gemini",), ["-i", "{prompt}"], ("gemini-cli",), ("@google/gemini-cli",)),
+    _agent("qwen", "Qwen Code", ("qwen",), ["-i", "{prompt}"], ("qwen-code",), ("@qwen-code/",)),
+    _agent("droid", "Factory Droid", ("droid",), ["{prompt}"], ("factory",)),
+    _agent("kiro", "Kiro", ("kiro-cli",), ["chat", "{prompt}"], ("kiro-cli",)),
+    _agent("cline", "Cline", ("cline",), ["{prompt}"]),
+    _agent("kilo", "Kilo Code", ("kilo", "kilocode"), ["--prompt", "{prompt}"], ("kilocode", "kilo-code"), ("@kilocode/cli",)),
+    _agent("pi", "Pi", ("pi",), ["{prompt}"], (), ("pi-coding-agent",)),
+    _agent("auggie", "Auggie", ("auggie",), ["{prompt}"], ("augment",), ("@augmentcode/auggie",)),
+    _agent("amp", "Amp", ("amp",), None, (), ("@sourcegraph/amp",)),
+    _agent("goose", "Goose", ("goose",), ["run", "--interactive", "--text", "{prompt}"]),
+    _agent("kimi", "Kimi Code", ("kimi",), None, ("kimi-code",)),
+    _agent("vibe", "Mistral Vibe", ("vibe",), ["{prompt}"], ("mistral",)),
+    _agent("junie", "Junie", ("junie",), None),
+    _agent("qoder", "Qoder", ("qodercli", "qoder"), None, ("qodercli",)),
+    _agent("openhands", "OpenHands", ("openhands",), ["-t", "{prompt}"]),
+    _agent("crush", "Crush", ("crush",), None),
+    _agent("devin", "Devin", ("devin",), ["--", "{prompt}"]),
+    _agent("hermes", "Hermes", ("hermes",), ["chat", "-q", "{prompt}"]),
+    _agent("openclaw", "OpenClaw", ("openclaw",), ["tui", "--message", "{prompt}"]),
+    _agent("antigravity", "Antigravity", ("agy",), None, ("agy",)),
+]
+AGENT = {a["id"]: a for a in AGENTS}
+NATIVE = ("claude", "codex", "opencode")  # read and written in their own session format
+LABELS = dict((a["id"], a["name"]) for a in AGENTS)
+LABELS["unknown"] = "another agent"
+ALIASES = {}
+for _a in AGENTS:
+    for _name in (_a["id"],) + tuple(_a["aliases"]) + tuple(_a["bins"]):
+        ALIASES.setdefault(_name, _a["id"])
+
 SESSION_ENV = {
     "claude": "CLAUDE_CODE_SESSION_ID",
     "codex": "CODEX_THREAD_ID",
@@ -138,7 +176,7 @@ def tool_version(binary, fallback):
     return m.group(0) if m else fallback
 
 
-FORK_CMD_RE = re.compile(r"(^|&&|;|\|)\s*(\S*/)?agent-fork(\s|$)")
+FORK_CMD_RE = re.compile(r"agent_fork\.py|(^|[;&|])\s*agent-fork(\s|$)")
 SHELL_TOOLS = ("bash", "shell", "exec_command", "exec", "local_shell", "run_shell_command")
 
 
@@ -775,27 +813,46 @@ def fork_opencode_native(sid, cwd=None):
 
 # ---------------------------------------------------------------- detection
 
+INTERPRETERS = ("node", "bun", "deno", "python", "python3", "bash", "sh", "zsh", "fish", "env")
 
-def ancestor_tool():
-    """Which agent is this shell running inside? Nearest ancestor wins."""
+
+def _process_agent(args):
+    """Agent id for one process command line, if it is a known agent."""
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=10).stdout
+        argv = shlex.split(args)
+    except ValueError:
+        argv = args.split()
+    if not argv:
+        return None
+    paths = [argv[0]]
+    if re.sub(r"[\d.]+$", "", os.path.basename(argv[0]).lower()) in INTERPRETERS:
+        paths += [a for a in argv[1:3] if not a.startswith("-") and " " not in a]  # the script it runs
+    names = [re.sub(r"\.(js|mjs|cjs|py|sh)$", "", os.path.basename(p).lower()) for p in paths]
+    for a in AGENTS:
+        if a["id"] == "cursor" and "cursor-agent" not in names and "cursor" not in paths[0].lower():
+            continue  # a bare `agent` command only counts when it is Cursor's
+        if any(n in a["bins"] for n in names) or any(pkg in p for pkg in a["packages"] for p in paths):
+            return a["id"]
+    return None
+
+
+def ancestor_agent():
+    """Which agent is this command running inside? The nearest one wins."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,args="], capture_output=True, text=True, timeout=10).stdout
     except Exception:
         return None
     procs = {}
     for line in out.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            procs[int(parts[0])] = (int(parts[1]), os.path.basename(parts[2]).lower())
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
     pid, hops = os.getppid(), 0
     while pid in procs and pid > 1 and hops < 40:
-        ppid, name = procs[pid]
-        if name.startswith("claude"):
-            return "claude"
-        if name.startswith("codex"):
-            return "codex"
-        if "opencode" in name:
-            return "opencode"
+        ppid, args = procs[pid]
+        found = _process_agent(args)
+        if found:
+            return found
         pid, hops = ppid, hops + 1
     return None
 
@@ -809,22 +866,24 @@ def list_sessions(tool, cwd):
 
 
 def resolve_source(cwd):
-    tool = ARGS.source
-    sid = ARGS.session
-    if not tool:
-        tool = ancestor_tool()
-        if not tool:
-            for t in ("codex", "opencode", "claude"):
-                if os.environ.get(SESSION_ENV[t]):
-                    tool = t
-                    break
-    if tool and not sid:
-        sid = os.environ.get(SESSION_ENV[tool])
-    if tool and sid:
-        return tool, sid
-    # Not inside an agent: take the most recently active chat in this folder.
+    """-> (agent id, session id). The session id is None when that agent's chats
+    can't be read from disk, so the agent has to write a handoff instead."""
+    agent = ARGS.source or ancestor_agent()
+    if not agent:
+        for t in ("codex", "opencode", "claude"):
+            if os.environ.get(SESSION_ENV[t]):
+                agent = t
+                break
+    if agent and agent not in NATIVE:
+        return agent, None
+    sid = ARGS.session or (os.environ.get(SESSION_ENV[agent]) if agent else None)
+    if agent and sid:
+        return agent, sid
+    if not agent and ARGS.via_skill:
+        return "unknown", None  # run by an agent we don't recognise
+    # Run from a plain terminal: take the most recently active chat in this folder.
     best = None
-    for t in ([tool] if tool else TOOLS):
+    for t in ([agent] if agent else NATIVE):
         try:
             rows = list_sessions(t, cwd)
         except ForkError:
@@ -835,6 +894,124 @@ def resolve_source(cwd):
         raise ForkError("no chat found to fork in %s (use --from and --session)" % cwd)
     say("Using latest %s chat in this folder: %s" % (LABELS[best[0]], best[1]))
     return best[0], best[1]
+
+
+# ---------------------------------------------------------------- handoff
+
+HANDOFF_FILE = ".agent-fork-handoff.md"
+MAX_PROMPT_CHARS = 300000  # stays well under the OS argument limit
+
+
+def need_handoff(source, target, cwd):
+    path = os.path.join(cwd, HANDOFF_FILE)
+    script = os.path.abspath(sys.argv[0])
+    print("NEED_HANDOFF")
+    print("%s chats can't be read from disk, so write the handoff yourself:" % LABELS[source])
+    print("1. Write the whole conversation so far, as Markdown, to: %s" % path)
+    print("   Include every user request in order (quoted closely), what you did and found")
+    print("   (files read or changed, commands and key results), decisions, the current")
+    print("   state, and what is unfinished or next. Be specific; don't invent anything.")
+    print("2. Then run: python3 %s %s --from %s --handoff %s"
+          % (shlex.quote(script), target, source, shlex.quote(path)))
+    return 3
+
+
+def read_handoff(path):
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except OSError as e:
+        raise ForkError("can't read handoff file %s: %s" % (path, e.strerror))
+    if os.path.basename(path) == HANDOFF_FILE:
+        try:
+            os.unlink(path)  # temporary file in the project folder; a copy is kept in the cache
+        except OSError:
+            pass
+    if not text.strip():
+        raise ForkError("the handoff file %s is empty" % path)
+    return text
+
+
+def transcript_parts(tr, source):
+    parts = []
+    for turn in tr.turns:
+        if turn["user"]:
+            parts.append("## User\n\n" + turn["user"])
+        blocks = render_items(turn, source, ARGS.tools)
+        if blocks:
+            parts.append("## Assistant\n\n" + "\n\n".join(blocks))
+    return parts
+
+
+def handoff_prompt(source, parts):
+    body = "\n\n".join(parts)
+    if len(body) > MAX_PROMPT_CHARS:  # keep the newest messages
+        kept, size = [], 0
+        for part in reversed(parts):
+            if size + len(part) + 2 > MAX_PROMPT_CHARS:
+                break
+            kept.insert(0, part)
+            size += len(part) + 2
+        body = "[Earlier messages omitted to fit]\n\n" + ("\n\n".join(kept) if kept else parts[-1][-MAX_PROMPT_CHARS:])
+    return ("Continue this conversation. It was moved here from %s with agent-fork. Everything "
+            "inside <previous-conversation> already happened: use it as context, and don't redo "
+            "finished work or re-run its commands. Reply with one short line saying you're ready, "
+            "then wait for my next message.\n\n<previous-conversation>\n%s\n</previous-conversation>\n"
+            % (LABELS[source], body))
+
+
+def save_prompt(prompt, source, target):
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    d = os.path.join(base, "agent-fork")
+    os.makedirs(d, exist_ok=True)
+    for old in glob.glob(os.path.join(d, "handoff-*.md")):  # keep a week of handoffs
+        try:
+            if time.time() - os.path.getmtime(old) > 7 * 86400:
+                os.unlink(old)
+        except OSError:
+            pass
+    path = os.path.join(d, "handoff-%s-%s-to-%s.md" % (time.strftime("%Y%m%d-%H%M%S"), source, target))
+    with open(path, "w") as fh:
+        fh.write(prompt)
+    return path
+
+
+def find_binary(names):
+    """First installed command from names; ignores terminal-provided wrapper shims."""
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and "cmux-cli-shims" not in d]
+    for name in names:
+        for d in dirs:
+            p = os.path.join(d, name)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return name
+    return None
+
+
+def launch_command(target, prompt_path):
+    """-> (shell command, True if it passes the chat as the first message)."""
+    a = AGENT[target]
+    binary = find_binary(a["bins"])
+    if not binary:
+        raise ForkError("%s isn't installed (no `%s` command found)" % (a["name"], a["bins"][0]))
+    if a["prompt"] is None:
+        return shlex.quote(binary), False
+    words = [shlex.quote(binary)]
+    for w in a["prompt"]:
+        words.append('"$(cat %s)"' % shlex.quote(prompt_path) if w == "{prompt}" else shlex.quote(w))
+    return " ".join(words), True
+
+
+def copy_to_clipboard(text):
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text, text=True, timeout=10, check=True)
+                return True
+            except Exception:
+                continue
+    return False
 
 
 # ---------------------------------------------------------------- opening
@@ -853,7 +1030,8 @@ def open_tab(cwd, command, how, focus=True):
             cmd = ["cmux", "new-workspace", "--cwd", cwd, "--command", command] + flag
         else:
             cmd = ["cmux", "new-surface", "--working-directory", cwd, "--command", command] + flag
-        return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
+        env = dict(os.environ, CMUX_QUIET="1")
+        return subprocess.run(cmd, capture_output=True, text=True, env=env).returncode == 0
     if os.environ.get("TMUX") and shutil.which("tmux"):
         detach = [] if focus else ["-d"]
         if how == "split":
@@ -885,7 +1063,7 @@ def say(msg):
 
 def cmd_list(cwd):
     print("Chats in %s" % cwd)
-    for t in TOOLS:
+    for t in NATIVE:
         try:
             rows = list_sessions(t, cwd)[:5]
         except ForkError as e:
@@ -902,19 +1080,15 @@ def cmd_list(cwd):
 def main(argv=None):
     global ARGS
     p = argparse.ArgumentParser(
-        prog="agent-fork",
-        description="Continue your current AI coding chat in Claude Code, Codex, or OpenCode, "
-                    "in a new terminal tab in the same folder. Inside a chat, run it as !agent-fork.",
-        epilog="examples:\n"
-               "  !agent-fork             copy this chat in the same tool\n"
-               "  !agent-fork codex       continue this chat in Codex\n"
-               "  !agent-fork opencode    continue this chat in OpenCode\n"
-               "  !agent-fork claude      continue this chat in Claude Code\n"
-               "  agent-fork --list       show recent chats in this folder",
+        prog="agent_fork.py",
+        description="Continue the current AI coding chat in another agent, in a new terminal tab "
+                    "in the same folder. Normally run by the agent-fork skill.",
+        epilog="agents: " + ", ".join(a["id"] for a in AGENTS),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("target", nargs="?", help="claude | codex | opencode (default: same tool)")
-    p.add_argument("--from", dest="source", metavar="TOOL", help="source tool (auto-detected)")
+    p.add_argument("target", nargs="?", help="agent to continue in (default: same agent)")
+    p.add_argument("--from", dest="source", metavar="AGENT", help="source agent (auto-detected)")
     p.add_argument("--session", metavar="ID", help="source session id (auto-detected)")
+    p.add_argument("--handoff", metavar="FILE", help="chat written by the agent itself ('-' for stdin)")
     p.add_argument("--cwd", metavar="DIR", help="folder to open in (default: the chat's folder)")
     p.add_argument("--split", dest="how", action="store_const", const="split", help="open in a split instead of a tab")
     p.add_argument("--workspace", dest="how", action="store_const", const="workspace", help="open in a new cmux workspace")
@@ -922,7 +1096,8 @@ def main(argv=None):
     p.add_argument("--no-focus", dest="focus", action="store_false", help="open the new tab without switching to it")
     p.add_argument("--tools", choices=("short", "full", "none"), default="short",
                    help="how much tool-call history to carry over (default: short)")
-    p.add_argument("--list", action="store_true", help="list recent chats in this folder")
+    p.add_argument("--list", action="store_true", help="list recent Claude/Codex/OpenCode chats in this folder")
+    p.add_argument("--via-skill", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("--version", action="version", version="agent-fork %s" % VERSION)
     p.set_defaults(how="tab")
@@ -932,47 +1107,76 @@ def main(argv=None):
         val = getattr(ARGS, attr)
         if val:
             if val.lower() not in ALIASES:
-                p.error("unknown tool %r (use claude, codex, or opencode)" % val)
+                p.error("unknown agent %r (known: %s)" % (val, ", ".join(a["id"] for a in AGENTS)))
             setattr(ARGS, attr, ALIASES[val.lower()])
 
     here = os.path.realpath(ARGS.cwd) if ARGS.cwd else os.getcwd()
+    count, new_id, prompt_path, auto = None, None, None, True
     try:
         if ARGS.list:
             cmd_list(here)
             return 0
-        source, sid = resolve_source(here)
-        target = ARGS.target or source
-        count = None
-        if source == target:  # same tool: use its own fork
-            if source == "claude":
-                cwd = here if ARGS.cwd else (_claude_file_cwd(claude_find_file(sid)) or here)
-                new_id, command = None, "claude --resume %s --fork-session" % sid
-            elif source == "codex":
-                cwd = here if ARGS.cwd else (codex_thread_cwd(sid) or here)
-                new_id, command = None, "codex fork %s" % sid
-            else:
-                cwd, new_id, command = fork_opencode_native(sid, here if ARGS.cwd else None)
+        if ARGS.handoff:
+            source = ARGS.source or ancestor_agent() or "unknown"
+            target = ARGS.target or (source if source != "unknown" else None)
+            parts = [read_handoff(ARGS.handoff)]
+            cwd = here
         else:
-            reader = {"claude": read_claude, "codex": read_codex, "opencode": read_opencode}[source]
-            tr = reader(sid).finish()
-            if not tr.turns:
-                raise ForkError("the %s chat %s has no messages yet" % (LABELS[source], sid))
-            cwd = here if ARGS.cwd else (tr.cwd if tr.cwd and os.path.isdir(tr.cwd) else here)
-            title = "%s (from %s)" % (base_title(tr.title)[:80], LABELS[source])
-            writer = {"claude": write_claude, "codex": write_codex, "opencode": write_opencode}[target]
-            new_id, command = writer(tr, cwd, title, source)
-            count = tr.message_count()
+            source, sid = resolve_source(here)
+            target = ARGS.target or (source if source != "unknown" else None)
+            if target is None:
+                raise ForkError("say which agent to fork to (for example: codex)")
+            if sid is None:
+                return need_handoff(source, target, here)
+            parts = None
+            if source == target:  # same agent: use its own fork
+                if source == "claude":
+                    cwd = here if ARGS.cwd else (_claude_file_cwd(claude_find_file(sid)) or here)
+                    command = "claude --resume %s --fork-session" % sid
+                elif source == "codex":
+                    cwd = here if ARGS.cwd else (codex_thread_cwd(sid) or here)
+                    command = "codex fork %s" % sid
+                else:
+                    cwd, new_id, command = fork_opencode_native(sid, here if ARGS.cwd else None)
+            else:
+                reader = {"claude": read_claude, "codex": read_codex, "opencode": read_opencode}[source]
+                tr = reader(sid).finish()
+                if not tr.turns:
+                    raise ForkError("the %s chat %s has no messages yet" % (LABELS[source], sid))
+                cwd = here if ARGS.cwd else (tr.cwd if tr.cwd and os.path.isdir(tr.cwd) else here)
+                count = tr.message_count()
+                if target in NATIVE:  # real history in the target's own format
+                    title = "%s (from %s)" % (base_title(tr.title)[:80], LABELS[source])
+                    writer = {"claude": write_claude, "codex": write_codex, "opencode": write_opencode}[target]
+                    new_id, command = writer(tr, cwd, title, source)
+                else:
+                    parts = transcript_parts(tr, source)
+        if parts is not None:  # handoff: the chat becomes the new session's first message
+            if target not in AGENT:
+                raise ForkError("say which agent to fork to (for example: codex)")
+            if not find_binary(AGENT[target]["bins"]):
+                raise ForkError("%s isn't installed (no `%s` command found)"
+                                % (LABELS[target], AGENT[target]["bins"][0]))
+            prompt = handoff_prompt(source, parts)
+            prompt_path = save_prompt(prompt, source, target)
+            command, auto = launch_command(target, prompt_path)
+            if not auto:
+                auto = None if copy_to_clipboard(prompt) else False
     except ForkError as e:
         print("agent-fork: %s" % e, file=sys.stderr)
         return 1
 
-    what = "%s chat" % LABELS[source]
-    if count is not None:
-        say("Forked %s (%d messages) -> %s %s" % (what, count, LABELS[target], new_id))
+    what = "%s chat%s" % (LABELS[source], " (%d messages)" % count if count else "")
+    if prompt_path is None:
+        say("Forked %s -> %s%s" % (what, LABELS[target], " " + new_id if new_id else ""))
+    elif auto:
+        say("Handed %s to %s as the first message of a new chat" % (what, LABELS[target]))
     else:
-        say("Forking %s -> new %s chat" % (what, LABELS[target]))
+        say("Opening %s. It can't take a first message, so %s" % (
+            LABELS[target], "the chat is on your clipboard: paste it (Cmd+V) and press Enter."
+            if auto is None else "paste the chat from %s." % prompt_path))
     if open_tab(cwd, command, ARGS.how, ARGS.focus):
-        say("Opened in a new %s: %s" % ("split" if ARGS.how == "split" else "tab", command))
+        say("Opened in a new %s." % ("split" if ARGS.how == "split" else "tab"))
     else:
         say("Run this to open it:\n  cd %s && %s" % (shlex.quote(cwd), command))
     return 0
